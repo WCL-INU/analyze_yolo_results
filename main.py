@@ -7,7 +7,8 @@ import matplotlib.pyplot as plt
 
 
 YOLO_RESULTS_DIR = Path("./data")
-YOLO_RESULTS_FILE = "cut_ANU-25-summer-17_20260112_*.parquet"
+YOLO_RESULTS_FILE = "cut_ANU-25-summer-4_20260105_*.parquet"
+# YOLO_RESULTS_FILE = "cut_ANU-25-summer-17_20260112_*.parquet"
 
 
 def main():
@@ -25,33 +26,119 @@ def main():
     print(f"Loaded {len(df)} rows, {len(df.columns)} columns")
     print(df.head())
 
-    col_map = {c.lower(): c for c in df.columns}
+    # frame  box_index     x     y  width  height
 
-    # converter -> (x_min, y_min, width, height)
-    def to_xywh(row):
-        cx = row[col_map["x"]]
-        cy = row[col_map["y"]]
-        w = row[col_map["width"]]
-        h = row[col_map["height"]]
-        return cx - w / 2.0, cy - h / 2.0, w, h
+    # Convert to NumPy once to speed up downstream plotting
+    cols = ["x", "y", "width", "height", "frame", "box_index"]
+    data_arrays = {
+        col: df[col].to_numpy(dtype=float, copy=False)
+        for col in cols
+        if col in df.columns
+    }
+    print(f"Converted columns to NumPy arrays: {list(data_arrays.keys())}")
 
-    # compute extents to set axes limits
-    boxes = [to_xywh(row) for _, row in df.iterrows()]
+    # # Plot histograms of x, y, width, height
+    # fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    # for ax, col in zip(axes.ravel(), cols):
+    #     if col in df.columns:
+    #         ax.hist(data_arrays[col][~np.isnan(data_arrays[col])], bins=500, color="C0", edgecolor="black")
+    #         ax.set_title(f"Histogram of {col}")
+    #         ax.set_xlabel(col)
+    #         ax.set_ylabel("Count")
+    #     else:
+    #         ax.text(0.5, 0.5, f"{col} not found", ha="center", va="center")
+    # plt.tight_layout()
+    # plt.show(block=False)
 
-    fig, ax = plt.subplots(figsize=(10, 10))
-    for i, (x, y, w, h) in enumerate(boxes):
-        ec = "red"
-        rect = Rectangle(
-            (x, y), w, h, linewidth=1, edgecolor=ec, facecolor="none", alpha=0.6
+    # Scatter plot of x vs y
+    if {"x", "y"} <= set(df.columns):
+        xy = np.column_stack((data_arrays["x"], data_arrays["y"]))
+        xy = xy[~np.isnan(xy).any(axis=1)]
+        fig2, ax2 = plt.subplots(figsize=(8, 6))
+        hb = ax2.hexbin(xy[:, 0], xy[:, 1], gridsize=100, cmap="inferno", mincnt=1)
+        fig2.colorbar(hb, ax=ax2, label="counts")
+        ax2.set_xlabel("x")
+        ax2.set_ylabel("y")
+        ax2.set_title("Distribution on x-y plane (hexbin)")
+        ax2.grid(True, linestyle=":", linewidth=0.5)
+        ax2.invert_yaxis()  # Invert y-axis if needed
+        plt.tight_layout()
+        plt.show(block=False)
+    else:
+        print("Columns x and y not found; skipping hexbin plot.")
+
+    # # Visualize bounding boxes on a all frames at once
+    # if {"x", "y", "width", "height"} <= set(df.columns):
+    #     # Using PatchCollection to avoid slow DataFrame iteration
+    #     bbox_data = np.column_stack(
+    #         (data_arrays["x"], data_arrays["y"], data_arrays["width"], data_arrays["height"])
+    #     )
+    #     bbox_data = bbox_data[~np.isnan(bbox_data).any(axis=1)]
+    #     fig3, ax3 = plt.subplots(figsize=(10, 8))
+    #     rectangles = [
+    #         Rectangle((x, y), w, h, linewidth=1, edgecolor="C1", facecolor="none", alpha=0.3)
+    #         for x, y, w, h in bbox_data
+    #     ]
+    #     from matplotlib.collections import PatchCollection
+
+    #     ax3.add_collection(PatchCollection(rectangles, match_original=True))
+    #     ax3.set_xlabel("x")
+    #     ax3.set_ylabel("y")
+    #     ax3.set_title("Bounding Boxes from YOLO Detections")
+    #     ax3.set_xlim(0, 1640)
+    #     ax3.set_ylim(0, 1232)
+    #     ax3.grid(True, linestyle=":", linewidth=0.5)
+    #     ax3.invert_yaxis()  # Invert y-axis if needed
+    #     plt.tight_layout()
+    #     plt.show()
+    # else:
+    #     print("Bounding box columns missing; skipping rectangle plot.")
+
+    # Visualize bounding boxes on a all frames at once with color by frame
+    if {"x", "y", "width", "height", "frame"} <= set(df.columns):
+        # Using PatchCollection to avoid slow DataFrame iteration
+        bbox_data = np.column_stack(
+            (
+                data_arrays["x"],
+                data_arrays["y"],
+                data_arrays["width"],
+                data_arrays["height"],
+                data_arrays["frame"],
+            )
         )
-        ax.add_patch(rect)
+        bbox_data = bbox_data[~np.isnan(bbox_data).any(axis=1)]
+        fig4, ax4 = plt.subplots(figsize=(10, 8))
+        frames = bbox_data[:, 4]
+        norm = plt.Normalize(vmin=np.min(frames), vmax=np.max(frames))
+        cmap = plt.get_cmap("viridis")
+        rectangles = [
+            Rectangle(
+                (x, y),
+                w,
+                h,
+                linewidth=1,
+                edgecolor=cmap(norm(frame)),
+                facecolor="none",
+                alpha=0.5,
+            )
+            for x, y, w, h, frame in bbox_data
+        ]
+        from matplotlib.collections import PatchCollection
 
-    ax.set_xlim(0, 1640)  # fixed image width
-    ax.set_ylim(0, 1232)  # fixed image height
-    ax.set_aspect("equal")
-    ax.set_title("All detected boxes")
-    plt.tight_layout()
-    plt.show(block=True)
+        ax4.add_collection(PatchCollection(rectangles, match_original=True))
+        ax4.set_xlabel("x")
+        ax4.set_ylabel("y")
+        ax4.set_title("Bounding Boxes from YOLO Detections Colored by Frame")
+        ax4.set_xlim(0, 1640)
+        ax4.set_ylim(0, 1232)
+        ax4.grid(True, linestyle=":", linewidth=0.5)
+        ax4.invert_yaxis()  # Invert y-axis if needed
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig4.colorbar(sm, ax=ax4)
+        cbar.set_label("Frame Number")
+        plt.tight_layout()
+        plt.show()
 
 
 if __name__ == "__main__":
