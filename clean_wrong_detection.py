@@ -1,152 +1,138 @@
 import os
-import glob
-import statistics
-import pandas as pd
-import numpy as np
+import duckdb
 from pathlib import Path
 
 # --- 설정 ---
 BASE_DIR = Path(__file__).parent
-INPUT_DIR = BASE_DIR / "data" / "raw"       # 원본 파일 폴더
-OUTPUT_DIR = BASE_DIR / "data" / "cleaned"  # 결과 저장 폴더
+INPUT_DIR = BASE_DIR / "data" / "raw"        # 원본 파일 폴더
+CLEANED_DIR = BASE_DIR / "data" / "cleaned"  # 정상 데이터 저장 폴더
+REMOVED_DIR = BASE_DIR / "data" / "removed"  # 삭제된 데이터 저장 폴더
 
-# --- 필터 설정 (사용자 요청 로직) ---
+# --- 필터 설정 ---
 GRID_SIZE = 20
-CONSECUTIVE_THRESHOLD = 16  # 연속성 임계값
+CONSECUTIVE_THRESHOLD = 16  # 연속성 임계값 (프레임 수)
 STD_DEV_THRESHOLD = 10.0    # 변동성 임계값
 MAX_GAP = 20                # 허용 Gap
 
-def get_grid_key(x, y, w, h):
-    cx = x + w / 2
-    cy = y + h / 2
-    return (int(cx // GRID_SIZE), int(cy // GRID_SIZE))
-
-def get_static_blacklist(df):
+def process_parquet_with_duckdb(con, p_file):
+    filename = p_file.name
+    
+    # 1. 원본 데이터 로드 및 Grid Key 계산
+    # DuckDB는 Parquet 파일을 직접 쿼리할 수 있습니다.
+    query_base = f"""
+        CREATE OR REPLACE TEMP VIEW raw_data AS 
+        SELECT *,
+               CAST((x + width/2) / {GRID_SIZE} AS INTEGER) AS gx,
+               CAST((y + height/2) / {GRID_SIZE} AS INTEGER) AS gy
+        FROM read_parquet('{str(p_file)}');
     """
-    DataFrame을 분석하여 정적 물체(오탐지)에 해당하는 Grid Key 집합(Blacklist)을 반환
+    con.execute(query_base)
+    
+    # 2. 복잡한 필터링 로직을 SQL로 구현
+    # 단계별 설명:
+    # (1) lagged_data: 이전 프레임과의 차이(diff) 계산
+    # (2) groups: diff가 MAX_GAP보다 크면 새로운 그룹(streak)으로 간주 (is_new_group = 1)
+    # (3) streak_ids: is_new_group을 누적 합계하여 고유한 streak_id 생성
+    # (4) aggregated: streak 별로 지속시간(duration)과 표준편차 계산
+    # (5) blacklisted_grids: 필터 조건(지속시간 & 변동성)을 만족하는 오탐지 Grid 식별
+    
+    analyze_sql = f"""
+        CREATE OR REPLACE TEMP VIEW flagged_data AS
+        WITH lagged_data AS (
+            SELECT *,
+                   frame - LAG(frame, 1, frame) OVER (PARTITION BY gx, gy ORDER BY frame) as diff
+            FROM raw_data
+        ),
+        groups AS (
+            SELECT *,
+                   CASE WHEN diff > {MAX_GAP} THEN 1 ELSE 0 END as is_new_group
+            FROM lagged_data
+        ),
+        streak_ids AS (
+            SELECT *,
+                   SUM(is_new_group) OVER (PARTITION BY gx, gy ORDER BY frame) as streak_id
+            FROM groups
+        ),
+        aggregated AS (
+            SELECT gx, gy, streak_id,
+                   MAX(frame) - MIN(frame) as duration,
+                   COALESCE(STDDEV(width), 0) as w_std,
+                   COALESCE(STDDEV(height), 0) as h_std
+            FROM streak_ids
+            GROUP BY gx, gy, streak_id
+        ),
+        blacklisted_grids AS (
+            SELECT DISTINCT gx, gy
+            FROM aggregated
+            WHERE duration > {CONSECUTIVE_THRESHOLD}
+              AND w_std < {STD_DEV_THRESHOLD}
+              AND h_std < {STD_DEV_THRESHOLD}
+        )
+        SELECT r.*, 
+               CASE WHEN b.gx IS NOT NULL THEN TRUE ELSE FALSE END as is_removed
+        FROM raw_data r
+        LEFT JOIN blacklisted_grids b ON r.gx = b.gx AND r.gy = b.gy;
     """
-    print(f"  - Analyzing {len(df)} rows for static objects...")
+    con.execute(analyze_sql)
     
-    # 프레임별로 데이터 그룹화 (속도 향상을 위해)
-    # { frame_num: [ {row_dict}, ... ] }
-    frames_data = {k: v.to_dict('records') for k, v in df.groupby('frame')}
-    sorted_frames = sorted(frames_data.keys())
-
-    # 격자별 상태 추적
-    # key: (gx, gy), value: { last_frame, current_streak, max_streak, w_list, h_list }
-    grid_history = {}
-
-    for frame in sorted_frames:
-        boxes = frames_data[frame]
-        
-        for box in boxes:
-            k = get_grid_key(box['x'], box['y'], box['width'], box['height'])
-            
-            if k not in grid_history:
-                grid_history[k] = {
-                    'last_frame': frame, 
-                    'current_streak': 0, 
-                    'max_streak': 0,
-                    'w_list': [], 'h_list': []
-                }
-            
-            history = grid_history[k]
-            frame_diff = frame - history['last_frame']
-            
-            # --- Gap 허용 연속성 체크 로직 ---
-            if frame_diff <= MAX_GAP:
-                if frame_diff > 0:
-                    history['current_streak'] += frame_diff
-            else:
-                # 끊김 -> 리셋
-                history['current_streak'] = 0
-            
-            # 최대 연속 기록 갱신
-            if history['current_streak'] > history['max_streak']:
-                history['max_streak'] = history['current_streak']
-            
-            # 상태 업데이트
-            history['last_frame'] = frame
-            history['w_list'].append(box['width'])
-            history['h_list'].append(box['height'])
-
-    # 블랙리스트 선정
-    blacklist = set()
-    for k, history in grid_history.items():
-        if history['max_streak'] > CONSECUTIVE_THRESHOLD:
-            # 안전장치: 변동성 체크
-            w_std = statistics.stdev(history['w_list']) if len(history['w_list']) > 1 else 0
-            h_std = statistics.stdev(history['h_list']) if len(history['h_list']) > 1 else 0
-            
-            if w_std < STD_DEV_THRESHOLD and h_std < STD_DEV_THRESHOLD:
-                blacklist.add(k)
-
-    print(f"  - Found {len(blacklist)} static grid zones.")
-    return blacklist
-
-def apply_filter(df, blacklist):
-    """
-    Blacklist에 해당하는 Grid의 박스를 제거
-    """
-    if not blacklist:
-        return df
+    # 결과 통계 확인
+    stats = con.execute("SELECT COUNT(*), SUM(CASE WHEN is_removed THEN 1 ELSE 0 END) FROM flagged_data").fetchone()
+    total_count = stats[0]
+    removed_count = stats[1] if stats[1] else 0
     
-    # 각 행에 대해 Grid Key 계산
-    # (벡터화 연산을 위해 numpy 사용)
-    cx = df['x'] + df['width'] / 2
-    cy = df['y'] + df['height'] / 2
+    # 3. 데이터 분리 저장
+    # (gx, gy, is_removed 컬럼은 제외하고 원본 스키마 유지)
     
-    gx = (cx // GRID_SIZE).astype(int)
-    gy = (cy // GRID_SIZE).astype(int)
+    # 3-1. 정상 데이터 저장 (Cleaned)
+    cleaned_path = CLEANED_DIR / filename
+    con.execute(f"""
+        COPY (SELECT * EXCLUDE (gx, gy, is_removed) FROM flagged_data WHERE is_removed = FALSE) 
+        TO '{str(cleaned_path)}' (FORMAT 'parquet');
+    """)
     
-    # 필터링 마스크 생성
-    # (gx, gy) 튜플을 만들어 비교하는 것은 판다스에서 느리므로, 문자열 키 등을 활용하거나 반복문 사용
-    # 여기서는 apply를 사용하여 정확하게 처리
-    def is_blacklisted(row):
-        k = (int(row['gx']), int(row['gy']))
-        return k in blacklist
-
-    # 임시 데이터프레임 생성
-    temp_df = pd.DataFrame({'gx': gx, 'gy': gy})
-    mask = temp_df.apply(is_blacklisted, axis=1)
+    # 3-2. 삭제된 데이터 저장 (Removed)
+    removed_path = REMOVED_DIR / filename
+    if removed_count > 0:
+        con.execute(f"""
+            COPY (SELECT * EXCLUDE (gx, gy, is_removed) FROM flagged_data WHERE is_removed = TRUE) 
+            TO '{str(removed_path)}' (FORMAT 'parquet');
+        """)
     
-    # 반전시켜서 살릴 것만 남김
-    return df[~mask].reset_index(drop=True)
+    return total_count, removed_count
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    parquet_files = list(INPUT_DIR.glob("*.parquet"))
+    # 폴더 생성
+    CLEANED_DIR.mkdir(parents=True, exist_ok=True)
+    REMOVED_DIR.mkdir(parents=True, exist_ok=True)
     
+    parquet_files = list(INPUT_DIR.glob("*.parquet"))
     print(f"Found {len(parquet_files)} files in {INPUT_DIR}")
+    
+    # DuckDB 인메모리 연결
+    con = duckdb.connect(database=':memory:')
     
     for p_file in parquet_files:
         print(f"\nProcessing: {p_file.name} ...")
         try:
-            df = pd.read_parquet(p_file)
-            if df.empty:
+            total, removed = process_parquet_with_duckdb(con, p_file)
+            
+            if total == 0:
                 print("  - Empty file.")
                 continue
-                
-            original_len = len(df)
-            
-            # 1. 블랙리스트 분석
-            blacklist = get_static_blacklist(df)
-            
-            # 2. 필터링
-            df_clean = apply_filter(df, blacklist)
-            
-            # 3. 저장
-            cleaned_len = len(df_clean)
-            removed = original_len - cleaned_len
-            
-            out_path = OUTPUT_DIR / p_file.name
-            df_clean.to_parquet(out_path, index=False)
-            
-            print(f"  - Saved to {out_path}")
-            print(f"  - Removed {removed} boxes ({removed/original_len*100:.1f}%)")
+
+            percent = (removed / total * 100) if total > 0 else 0
+            print(f"  - Total: {total}, Removed: {removed} ({percent:.1f}%)")
+            print(f"  - Saved cleaned to: {CLEANED_DIR / p_file.name}")
+            if removed > 0:
+                print(f"  - Saved removed to: {REMOVED_DIR / p_file.name}")
             
         except Exception as e:
             print(f"  - Error: {e}")
+            # 에러 상세 내용을 보고 싶다면 아래 주석 해제
+            # import traceback
+            # traceback.print_exc()
+
+    con.close()
 
 if __name__ == "__main__":
     main()
