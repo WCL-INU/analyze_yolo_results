@@ -4,23 +4,26 @@ from pathlib import Path
 
 # --- 설정 ---
 BASE_DIR = Path(__file__).parent
-INPUT_DIR = BASE_DIR / "data" / "raw"        # 원본 파일 폴더
-CLEANED_DIR = BASE_DIR / "data" / "cleaned"  # 정상 데이터 저장 폴더
-REMOVED_DIR = BASE_DIR / "data" / "removed"  # 삭제된 데이터 저장 폴더
+INPUT_DIR = BASE_DIR / "data" / "raw"
+CLEANED_DIR = BASE_DIR / "data" / "cleaned"
+REMOVED_DIR = BASE_DIR / "data" / "removed"
 
 # --- 필터 설정 ---
 GRID_SIZE = 20
-CONSECUTIVE_THRESHOLD = 16  # 연속성 임계값 (프레임 수)
-STD_DEV_THRESHOLD = 10.0    # 변동성 임계값 (너비/높이 표준편차)
-MAX_GAP = 20                # 허용 Gap
+CONSECUTIVE_THRESHOLD = 16
+STD_DEV_THRESHOLD = 10.0
+MAX_GAP = 20
 
-# [NEW] ROI 설정: 이 값보다 Y좌표가 작으면(영상 상단) 무조건 제거
-Y_FILTER_LIMIT = 1000        # 예: Y좌표 0~300 사이의 박스는 무시 (배경/하늘 등)
+# [NEW] ROI(관심 영역) 설정
+# 설정된 범위 '밖'에 있는 데이터는 모두 제거됩니다.
+Y_FILTER_TOP_LIMIT = 1000      # Y < limit (상단) 제거
+X_FILTER_LEFT_LIMIT = 1000     # X < left (좌측) 제거
+X_FILTER_RIGHT_LIMIT = 1640   # X > right (우측) 제거 (영상 해상도에 맞춰 설정)
 
 def process_parquet_with_duckdb(con, p_file):
     filename = p_file.name
     
-    # 1. 원본 데이터 로드 및 Grid Key 계산
+    # 1. 원본 데이터 로드
     query_base = f"""
         CREATE OR REPLACE TEMP VIEW raw_data AS 
         SELECT *,
@@ -30,7 +33,7 @@ def process_parquet_with_duckdb(con, p_file):
     """
     con.execute(query_base)
     
-    # 2. 복잡한 필터링 로직을 SQL로 구현
+    # 2. 분석 및 필터링 로직
     analyze_sql = f"""
         CREATE OR REPLACE TEMP VIEW flagged_data AS
         WITH lagged_data AS (
@@ -65,9 +68,12 @@ def process_parquet_with_duckdb(con, p_file):
         )
         SELECT r.*, 
                CASE 
-                   -- [수정됨] 1. Y좌표가 기준치 미만(상단부)이면 무조건 제거
-                   WHEN r.y < {Y_FILTER_LIMIT} THEN TRUE
-                   -- 2. 정적 물체(Box Filtering)로 판별되면 제거
+                   -- [수정됨] ROI(좌표) 필터링: 설정 범위 밖이면 제거
+                   WHEN r.y < {Y_FILTER_TOP_LIMIT} THEN TRUE    -- 상단 제거
+                   WHEN r.x < {X_FILTER_LEFT_LIMIT} THEN TRUE   -- 좌측 제거
+                   WHEN r.x > {X_FILTER_RIGHT_LIMIT} THEN TRUE  -- 우측 제거
+                   
+                   -- 기존 정적 물체(Box Filtering) 제거
                    WHEN b.gx IS NOT NULL THEN TRUE 
                    ELSE FALSE 
                END as is_removed
@@ -76,12 +82,12 @@ def process_parquet_with_duckdb(con, p_file):
     """
     con.execute(analyze_sql)
     
-    # 결과 통계 확인
+    # 결과 통계
     stats = con.execute("SELECT COUNT(*), SUM(CASE WHEN is_removed THEN 1 ELSE 0 END) FROM flagged_data").fetchone()
     total_count = stats[0]
     removed_count = stats[1] if stats[1] else 0
     
-    # 3. 데이터 분리 저장
+    # 3. 저장
     cleaned_path = CLEANED_DIR / filename
     con.execute(f"""
         COPY (SELECT * EXCLUDE (gx, gy, is_removed) FROM flagged_data WHERE is_removed = FALSE) 
@@ -101,9 +107,9 @@ def main():
     CLEANED_DIR.mkdir(parents=True, exist_ok=True)
     REMOVED_DIR.mkdir(parents=True, exist_ok=True)
     
-    parquet_files = list(INPUT_DIR.glob("*-2_2026*.parquet"))
+    parquet_files = list(INPUT_DIR.glob("*-15_2026*.parquet"))
     print(f"Found {len(parquet_files)} files in {INPUT_DIR}")
-    print(f"Filtering Logic: Box Filter + Y < {Y_FILTER_LIMIT} (Top Area Removal)")
+    print(f"ROI Filter: Y>{Y_FILTER_TOP_LIMIT}, {X_FILTER_LEFT_LIMIT}<X<{X_FILTER_RIGHT_LIMIT}")
     
     con = duckdb.connect(database=':memory:')
     
@@ -118,7 +124,6 @@ def main():
 
             percent = (removed / total * 100) if total > 0 else 0
             print(f"  - Total: {total}, Removed: {removed} ({percent:.1f}%)")
-            print(f"  - Saved cleaned to: {CLEANED_DIR / p_file.name}")
             
         except Exception as e:
             print(f"  - Error: {e}")
