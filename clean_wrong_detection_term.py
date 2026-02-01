@@ -10,11 +10,6 @@ INPUT_DIR = BASE_DIR / "data" / "raw"
 CLEANED_DIR = BASE_DIR / "data" / "cleaned"
 REMOVED_DIR = BASE_DIR / "data" / "removed"
 
-# --- [핵심 제어] 시간 기준 설정 ---
-# None으로 두면 마지막으로 성공한 작업 이후의 파일만 처리합니다.
-# 특정 시점부터 재작업하고 싶다면 '2026-01-30 12:00:00' 형태로 입력하세요.
-SINCE_DATETIME = '2026-01-30 22:10:00'  # 예: '2026-01-25 00:00:00'
-
 # --- 필터 튜닝 ---
 GRID_SIZE = 20          # 격자 크기
 MAX_GAP = 20            # 잠깐 끊겨도 같은 물체로 볼 허용 간격
@@ -22,20 +17,6 @@ MAX_GAP = 20            # 잠깐 끊겨도 같은 물체로 볼 허용 간격
 # [핵심 로직 설정]
 CONSECUTIVE_THRESHOLD = 16  # "일정 프레임 동안 감지되면" 
 LOOKAHEAD_FRAMES = 24       # "그 뒤로 이만큼을 봤는데 없으면" -> "아까 걔는 오탐지였구나" 하고 삭제
-
-def get_reference_time():
-    """기준이 되는 시간을 결정합니다."""
-    # 1. 사용자가 코드에 직접 날짜를 지정한 경우
-    if SINCE_DATETIME:
-        return datetime.strptime(SINCE_DATETIME, '%Y-%m-%d %H:%M:%S').timestamp()
-    
-    # 2. 지정하지 않은 경우, Cleaned 폴더 내 가장 최근 파일의 시간을 기준점으로 삼음
-    cleaned_files = list(CLEANED_DIR.glob("*.parquet"))
-    if not cleaned_files:
-        return 0  # 파일이 하나도 없으면 전체 처리
-    
-    # 가장 마지막에 생성/수정된 cleaned 파일의 시간을 반환
-    return max(f.stat().st_mtime for f in cleaned_files)
 
 def process_parquet_with_duckdb(con, p_file):
     filename = p_file.name
@@ -132,33 +113,36 @@ def process_parquet_with_duckdb(con, p_file):
     return total, removed
 
 def main():
+    # 폴더 생성
     CLEANED_DIR.mkdir(parents=True, exist_ok=True)
     REMOVED_DIR.mkdir(parents=True, exist_ok=True)
     
-    # 기준 시간 가져오기
-    ref_time = get_reference_time()
-    print(f"기준 시점: {datetime.fromtimestamp(ref_time).strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # RAW 폴더에서 기준 시간보다 새로운 파일만 필터링
-    all_raw_files = list(INPUT_DIR.glob("*.parquet"))
-    new_files = [f for f in all_raw_files if f.stat().st_mtime > ref_time]
-
-    if not new_files:
-        print("새로 추가된 데이터가 없습니다.")
-        return
-
-    print(f"새로 발견된 파일 {len(new_files)}개를 처리합니다.")
+    parquet_files = list(INPUT_DIR.glob("*2025*.parquet"))
+    print(f"Found {len(parquet_files)} files in {INPUT_DIR}")
     
+    # DuckDB 인메모리 연결
     con = duckdb.connect(database=':memory:')
     
-    for p_file in new_files:
-        print(f"Processing: {p_file.name} ...", end=" ", flush=True)
+    for p_file in parquet_files:
+        print(f"\nProcessing: {p_file.name} ...")
         try:
-            # 기존 process_parquet_with_duckdb 함수 호출
             total, removed = process_parquet_with_duckdb(con, p_file)
-            print(f"[OK] {total-removed}/{total} lines saved.")
+            
+            if total == 0:
+                print("  - Empty file.")
+                continue
+
+            percent = (removed / total * 100) if total > 0 else 0
+            print(f"  - Total: {total}, Removed: {removed} ({percent:.1f}%)")
+            print(f"  - Saved cleaned to: {CLEANED_DIR / p_file.name}")
+            if removed > 0:
+                print(f"  - Saved removed to: {REMOVED_DIR / p_file.name}")
+            
         except Exception as e:
-            print(f"[ERR] {e}")
+            print(f"  - Error: {e}")
+            # 에러 상세 내용을 보고 싶다면 아래 주석 해제
+            # import traceback
+            # traceback.print_exc()
 
     con.close()
 
